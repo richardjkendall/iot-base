@@ -3,7 +3,7 @@
  *
  * This is a minimal bootstrap firmware for ESP8266 devices (ESP-01 compatible).
  *
- * On first boot:
+ * On first boot (no saved config):
  * 1. Creates WiFi access point "ESP-SETUP-[MAC]" (password: "configure")
  * 2. Serves configuration portal at 192.168.4.1
  * 3. User configures WiFi credentials and API server
@@ -11,16 +11,26 @@
  *
  * On subsequent boots:
  * 1. Connects to configured WiFi
- * 2. Contacts API server with device MAC address
- * 3. Checks for OTA firmware updates
- * 4. If update available, downloads and installs it
- * 5. New firmware takes over
+ * 2. Contacts API server (GET /update) with the standard x-ESP8266-* headers
+ * 3. If the server sends a firmware image, installs it and reboots into it
+ * 4. New firmware takes over
  *
- * Factory Reset: Reflash this firmware to reconfigure device
+ * If WiFi can't be reached at boot, the configuration portal is started
+ * (pre-filled with the saved settings). If nobody uses it for
+ * PORTAL_IDLE_TIMEOUT it reboots and tries WiFi again, so a temporary
+ * router outage recovers by itself.
+ *
+ * Config contract for application firmware: /config.json on LittleFS
+ *   { "wifi_ssid": "...", "wifi_password": "...",
+ *     "api_server": "host-or-ip", "api_port": 80 }
+ * App firmware must be built with the same flash layout (eesz=1M64) so it
+ * finds the same LittleFS partition.
+ *
+ * Factory reset: `make factory` (erases all flash, including the config).
+ * A normal reflash keeps the config.
  */
 
 #include <ESP8266WiFi.h>
-#include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
 #include <ESP8266WebServer.h>
 #include <DNSServer.h>
@@ -28,13 +38,16 @@
 #include <ArduinoJson.h>
 
 // Configuration
-#define DEBUG              1
-#define MAX_WIFI_WAIT      20
-#define CONFIG_FILE        "/config.json"
-#define AP_SSID_PREFIX     "ESP-SETUP-"
-#define AP_PASSWORD        "configure"
-#define DNS_PORT           53
-#define UPDATE_CHECK_INTERVAL 60000  // Check for updates every 60 seconds
+#define FIRMWARE_VERSION      "iot-base-1.1.0"
+#define DEBUG                 1
+#define MAX_WIFI_WAIT         20       // seconds per connection attempt
+#define MAX_RECONNECT_FAILS   15       // failed reconnects in loop() before rebooting
+#define CONFIG_FILE           "/config.json"
+#define AP_SSID_PREFIX        "ESP-SETUP-"
+#define AP_PASSWORD           "configure"
+#define DNS_PORT              53
+#define UPDATE_CHECK_INTERVAL 60000UL  // check for updates every 60 seconds
+#define PORTAL_IDLE_TIMEOUT   300000UL // fallback portal reboots after 5 min idle
 
 // Global variables
 String wifiSsid = "";
@@ -42,11 +55,14 @@ String wifiPassword = "";
 String apiServer = "";
 int apiPort = 80;
 bool configLoaded = false;
+bool portalMode = false;
 unsigned long lastUpdateCheck = 0;
+unsigned long lastPortalActivity = 0;
+int reconnectFailures = 0;
+String networkOptions = "";   // cached <option> list from the last WiFi scan
 
 // Global clients
 WiFiClient wifiClient;
-HTTPClient http;
 ESP8266WebServer server(80);
 DNSServer dnsServer;
 
@@ -73,6 +89,27 @@ void writeError(String module, String message) {
   Serial.print(module);
   Serial.print(",");
   Serial.println(message);
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+String htmlEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    switch (c) {
+      case '&':  out += "&amp;";  break;
+      case '<':  out += "&lt;";   break;
+      case '>':  out += "&gt;";   break;
+      case '"':  out += "&quot;"; break;
+      case '\'': out += "&#39;";  break;
+      default:   out += c;
+    }
+  }
+  return out;
 }
 
 // ============================================================================
@@ -105,10 +142,15 @@ bool loadConfig() {
     return false;
   }
 
-  wifiSsid = doc["wifi_ssid"].as<String>();
-  wifiPassword = doc["wifi_password"].as<String>();
-  apiServer = doc["api_server"].as<String>();
+  wifiSsid = doc["wifi_ssid"] | "";
+  wifiPassword = doc["wifi_password"] | "";
+  apiServer = doc["api_server"] | "";
   apiPort = doc["api_port"] | 80;
+
+  if (wifiSsid.length() == 0 || apiServer.length() == 0) {
+    writeError("config", "Config is missing wifi_ssid or api_server");
+    return false;
+  }
 
   writeStatus("config", "Configuration loaded successfully");
   if (DEBUG) {
@@ -155,7 +197,7 @@ bool saveConfig() {
 bool connectToWiFi() {
   int loopCount = 0;
   WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSsid, wifiPassword);
+  WiFi.begin(wifiSsid, wifiPassword);   // empty password = open network
 
   writeStatus("wifi", "Connecting to " + wifiSsid);
 
@@ -184,11 +226,13 @@ void checkForUpdates() {
 
   writeStatus("update", "Checking for updates at " + url);
 
-  t_httpUpdate_return ret = ESPhttpUpdate.update(wifiClient, url, "");
+  // FIRMWARE_VERSION is sent to the server as the x-ESP8266-version header
+  t_httpUpdate_return ret = ESPhttpUpdate.update(wifiClient, url, FIRMWARE_VERSION);
 
   switch(ret) {
     case HTTP_UPDATE_FAILED:
-      writeError("update", "Update failed: " + ESPhttpUpdate.getLastErrorString());
+      writeError("update", "Update failed (" + String(ESPhttpUpdate.getLastError()) + "): " +
+                 ESPhttpUpdate.getLastErrorString());
       break;
     case HTTP_UPDATE_NO_UPDATES:
       writeStatus("update", "No updates available");
@@ -215,41 +259,79 @@ const char* HTML_HEAD =
   "button{width:100%;padding:12px;margin-top:20px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer;font-size:16px}"
   "button:hover{background:#0056b3}"
   ".info{background:#e7f3ff;padding:10px;border-radius:4px;margin-bottom:20px;font-size:14px}"
+  ".hint{font-size:12px;color:#888}"
   "</style></head><body>";
 
 const char* HTML_FOOTER = "</body></html>";
 
+// Scans once and caches the result: scanning blocks for ~2s and drops AP
+// traffic, so we don't want every captive-portal probe to trigger one.
+void scanNetworks() {
+  writeStatus("portal", "Scanning for WiFi networks");
+  int n = WiFi.scanNetworks();
+  networkOptions = "";
+  bool savedSsidFound = false;
+
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;   // hidden network
+    bool selected = (ssid == wifiSsid);
+    if (selected) savedSsidFound = true;
+    networkOptions += "<option value='" + htmlEscape(ssid) + "'" + (selected ? " selected" : "") + ">" +
+                      htmlEscape(ssid) + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+  }
+  WiFi.scanDelete();
+
+  // Saved SSID not visible (or hidden): preselect "custom" so it's pre-filled
+  bool useCustom = wifiSsid.length() > 0 && !savedSsidFound;
+  networkOptions += String("<option value='custom'") + (useCustom ? " selected" : "") + ">Custom SSID...</option>";
+
+  writeStatus("portal", "Found " + String(n) + " networks");
+}
+
 void handleRoot() {
+  lastPortalActivity = millis();
+
+  if (server.hasArg("rescan")) {
+    scanNetworks();
+  }
+
   String macAddress = WiFi.macAddress();
+  bool customSelected = networkOptions.indexOf("value='custom' selected") >= 0;
 
   String html = HTML_HEAD;
   html += "<div class='container'>";
   html += "<h1>ESP8266 Setup</h1>";
-  html += "<div class='info'>Configure your device to connect to WiFi and your API server.<br><strong>Device MAC:</strong> " + macAddress + "</div>";
+  html += "<div class='info'>Configure your device to connect to WiFi and your API server.<br>";
+  html += "<strong>Device MAC:</strong> " + macAddress + "<br>";
+  html += "<strong>Firmware:</strong> " FIRMWARE_VERSION;
+  if (configLoaded) {
+    html += "<br><strong>Note:</strong> could not connect to <em>" + htmlEscape(wifiSsid) + "</em>. Check the settings below.";
+  }
+  html += "</div>";
   html += "<form action='/save' method='POST'>";
 
-  // WiFi SSID dropdown with scan results
-  html += "<label>WiFi Network:</label>";
-  html += "<select name='ssid' id='ssid'>";
+  // WiFi SSID dropdown with cached scan results
+  html += "<label>WiFi Network: <a class='hint' href='/?rescan=1'>rescan</a></label>";
+  html += "<select name='ssid' id='ssid'>" + networkOptions + "</select>";
 
-  int n = WiFi.scanNetworks();
-  for (int i = 0; i < n; i++) {
-    html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
-  }
-  html += "<option value='custom'>Custom SSID...</option>";
-  html += "</select>";
-
-  html += "<input type='text' name='custom_ssid' id='custom_ssid' placeholder='Enter custom SSID' style='display:none;margin-top:10px'>";
+  html += "<input type='text' name='custom_ssid' id='custom_ssid' placeholder='Enter custom SSID' value='" +
+          (customSelected ? htmlEscape(wifiSsid) : String("")) + "' style='display:" +
+          (customSelected ? "block" : "none") + ";margin-top:10px'" + (customSelected ? " required" : "") + ">";
 
   html += "<label>WiFi Password:</label>";
-  html += "<input type='password' name='password' id='password' required>";
+  html += "<input type='password' name='password' id='password'>";
+  html += configLoaded
+          ? "<div class='hint'>Leave blank to keep the saved password (for the same network).</div>"
+          : "<div class='hint'>Leave blank for an open network.</div>";
   html += "<label style='font-size:14px;margin-top:8px'><input type='checkbox' id='showPassword' style='width:auto;margin-right:5px'> Show password</label>";
 
   html += "<label>API Server (IP or hostname):</label>";
-  html += "<input type='text' name='api_server' placeholder='e.g., 192.168.1.100 or api.example.com' required>";
+  html += "<input type='text' name='api_server' placeholder='e.g., 192.168.1.100 or api.example.com' value='" +
+          htmlEscape(apiServer) + "' required>";
 
   html += "<label>API Port:</label>";
-  html += "<input type='number' name='api_port' value='80' required>";
+  html += "<input type='number' name='api_port' min='1' max='65535' value='" + String(apiPort) + "' required>";
 
   html += "<button type='submit'>Save & Reboot</button>";
   html += "</form>";
@@ -272,26 +354,56 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-void handleSave() {
-  String selectedSsid = server.arg("ssid");
+void sendError(int code, const String& message) {
+  String html = HTML_HEAD;
+  html += "<div class='container'>";
+  html += "<h1>Error</h1>";
+  html += "<p>" + htmlEscape(message) + "</p>";
+  html += "<a href='/'>Go Back</a>";
+  html += "</div>";
+  html += HTML_FOOTER;
+  server.send(code, "text/html", html);
+}
 
-  if (selectedSsid == "custom") {
-    wifiSsid = server.arg("custom_ssid");
-  } else {
-    wifiSsid = selectedSsid;
+void handleSave() {
+  lastPortalActivity = millis();
+
+  String selectedSsid = server.arg("ssid");
+  String newSsid = (selectedSsid == "custom") ? server.arg("custom_ssid") : selectedSsid;
+  String newServer = server.arg("api_server");
+  long newPort = server.arg("api_port").toInt();
+  newSsid.trim();
+  newServer.trim();
+
+  if (newSsid.length() == 0) {
+    sendError(400, "WiFi network name is required.");
+    return;
+  }
+  if (newServer.length() == 0) {
+    sendError(400, "API server is required.");
+    return;
+  }
+  if (newPort < 1 || newPort > 65535) {
+    sendError(400, "API port must be between 1 and 65535.");
+    return;
   }
 
-  wifiPassword = server.arg("password");
-  apiServer = server.arg("api_server");
-  apiPort = server.arg("api_port").toInt();
+  String newPassword = server.arg("password");
+  // Blank password on the fallback portal with the same SSID = keep the saved one
+  if (!(newPassword.length() == 0 && configLoaded && newSsid == wifiSsid)) {
+    wifiPassword = newPassword;
+  }
+  wifiSsid = newSsid;
+  apiServer = newServer;
+  apiPort = (int)newPort;
 
   if (saveConfig()) {
     String html = HTML_HEAD;
     html += "<div class='container'>";
     html += "<h1>Configuration Saved!</h1>";
     html += "<div class='info'>Device will reboot and connect to your WiFi network.</div>";
-    html += "<p>SSID: " + wifiSsid + "</p>";
-    html += "<p>API Server: " + apiServer + ":" + String(apiPort) + "</p>";
+    html += "<p>SSID: " + htmlEscape(wifiSsid) + "</p>";
+    html += "<p>API Server: " + htmlEscape(apiServer) + ":" + String(apiPort) + "</p>";
     html += "</div>";
     html += HTML_FOOTER;
 
@@ -300,30 +412,28 @@ void handleSave() {
     delay(2000);
     ESP.restart();
   } else {
-    String html = HTML_HEAD;
-    html += "<div class='container'>";
-    html += "<h1>Error</h1>";
-    html += "<p>Failed to save configuration. Please try again.</p>";
-    html += "<a href='/'>Go Back</a>";
-    html += "</div>";
-    html += HTML_FOOTER;
-
-    server.send(500, "text/html", html);
+    sendError(500, "Failed to save configuration. Please try again.");
   }
 }
 
 void handleNotFound() {
   // Redirect all unknown requests to root (captive portal behavior)
-  server.sendHeader("Location", "/", true);
+  server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
   server.send(302, "text/plain", "");
 }
 
 void startConfigPortal() {
+  portalMode = true;
+  lastPortalActivity = millis();
+
   String macAddress = WiFi.macAddress();
   macAddress.replace(":", "");
   String apName = AP_SSID_PREFIX + macAddress.substring(6);
 
-  WiFi.mode(WIFI_AP);
+  // AP+STA so we can still scan for networks while the AP is up
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP_STA);
+  scanNetworks();
   WiFi.softAP(apName.c_str(), AP_PASSWORD);
 
   writeStatus("ap", "Access Point started");
@@ -351,7 +461,10 @@ void setup() {
   // Initialize serial
   Serial.begin(115200);
   Serial.println();
-  writeStatus("boot", "ESP8266 Bootstrap Template v1.0");
+  writeStatus("boot", "ESP8266 Bootstrap " FIRMWARE_VERSION);
+
+  // Our config lives in LittleFS; don't also write credentials to the SDK's flash area
+  WiFi.persistent(false);
 
   String mac = WiFi.macAddress();
   writeStatus("mac", mac);
@@ -363,46 +476,57 @@ void setup() {
     // No config found - start configuration portal
     writeStatus("mode", "Starting configuration portal");
     startConfigPortal();
-  } else {
-    // Config found - try to connect and get updates
+  } else if (connectToWiFi()) {
+    // Config found and connected - check for updates
     writeStatus("mode", "Normal operation mode");
-
-    if (connectToWiFi()) {
-      // Connected successfully - check for updates
-      checkForUpdates();
-      lastUpdateCheck = millis();
-    } else {
-      // Failed to connect - might want to fall back to config portal
-      writeError("boot", "Failed to connect to WiFi - continuing anyway");
-    }
+    checkForUpdates();
+    lastUpdateCheck = millis();
+  } else {
+    // Config found but WiFi unreachable - let the user fix it via the portal
+    writeError("boot", "Failed to connect to WiFi - starting configuration portal");
+    startConfigPortal();
   }
 }
 
 void loop() {
-  if (!configLoaded) {
-    // We're in config portal mode
+  if (portalMode) {
     dnsServer.processNextRequest();
     server.handleClient();
-  } else {
-    // We're in normal operation mode
 
-    // Check WiFi connection
-    if (WiFi.status() != WL_CONNECTED) {
-      writeStatus("wifi", "Disconnected - attempting to reconnect");
-      if (connectToWiFi()) {
-        writeStatus("wifi", "Reconnected successfully");
-      }
+    // Fallback portal (we have a saved config): if nobody is using it,
+    // reboot and retry WiFi in case the network was only temporarily down.
+    if (configLoaded && millis() - lastPortalActivity > PORTAL_IDLE_TIMEOUT) {
+      writeStatus("portal", "Idle timeout - rebooting to retry WiFi");
+      delay(100);
+      ESP.restart();
     }
-
-    // Periodically check for OTA updates
-    if (millis() - lastUpdateCheck > UPDATE_CHECK_INTERVAL) {
-      if (WiFi.status() == WL_CONNECTED) {
-        checkForUpdates();
-      }
-      lastUpdateCheck = millis();
-    }
-
-    // Small delay to prevent tight loop
-    delay(1000);
+    return;
   }
+
+  // Normal operation mode
+
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    writeStatus("wifi", "Disconnected - attempting to reconnect");
+    if (connectToWiFi()) {
+      writeStatus("wifi", "Reconnected successfully");
+      reconnectFailures = 0;
+    } else if (++reconnectFailures >= MAX_RECONNECT_FAILS) {
+      // Reboot; if WiFi is still unreachable at boot, the portal starts
+      writeError("wifi", "Too many reconnect failures - rebooting");
+      delay(100);
+      ESP.restart();
+    }
+  }
+
+  // Periodically check for OTA updates
+  if (millis() - lastUpdateCheck > UPDATE_CHECK_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      checkForUpdates();
+    }
+    lastUpdateCheck = millis();
+  }
+
+  // Small delay to prevent tight loop
+  delay(1000);
 }
