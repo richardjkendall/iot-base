@@ -28,19 +28,18 @@ FQBN        ?= esp8266:esp8266:generic:$(BOARD_OPTS)
 PORT        ?= $(firstword $(wildcard /dev/cu.usbserial-* /dev/cu.wchusbserial* /dev/cu.SLAB_USBtoUART*))
 MONITOR_BAUD ?= 115200
 
-SOURCES     := $(SKETCH).ino $(wildcard *.h *.cpp)
 
 .PHONY: all build flash factory monitor deps ports clean check-cli check-port
 
 all: build
 
-build: $(BIN)
-
-$(BIN): $(SOURCES) Makefile | check-cli
+# Always invoke the compiler (arduino-cli caches internally). Make's timestamp
+# check can't see removed files like secrets.h, which would leave a stale .bin.
+build: check-cli
 	$(ARDUINO_CLI) compile --fqbn $(FQBN) --output-dir $(BUILD_DIR) --warnings default .
 	@ls -l $(BIN)
 
-flash: $(BIN) check-port
+flash: build check-port
 	$(ARDUINO_CLI) upload --fqbn $(FQBN) --port $(PORT) --input-dir $(BUILD_DIR) .
 
 # wipe=all makes esptool erase the whole chip first, so the device boots
