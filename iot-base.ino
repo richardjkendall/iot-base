@@ -272,9 +272,25 @@ void scanNetworks() {
   networkOptions = "";
   bool savedSsidFound = false;
 
-  for (int i = 0; i < n; i++) {
+  // Order by signal strength (strongest first) so the first time we see an
+  // SSID is its best access point; later duplicates (mesh nodes) are skipped.
+  int order[n > 0 ? n : 1];
+  for (int i = 0; i < n; i++) order[i] = i;
+  for (int i = 1; i < n; i++) {
+    int cur = order[i], j = i - 1;
+    while (j >= 0 && WiFi.RSSI(order[j]) < WiFi.RSSI(cur)) { order[j + 1] = order[j]; j--; }
+    order[j + 1] = cur;
+  }
+
+  int unique = 0;
+  for (int k = 0; k < n; k++) {
+    int i = order[k];
     String ssid = WiFi.SSID(i);
     if (ssid.length() == 0) continue;   // hidden network
+    bool seen = false;
+    for (int p = 0; p < k && !seen; p++) seen = (WiFi.SSID(order[p]) == ssid);
+    if (seen) continue;
+    unique++;
     bool selected = (ssid == wifiSsid);
     if (selected) savedSsidFound = true;
     networkOptions += "<option value='" + htmlEscape(ssid) + "'" + (selected ? " selected" : "") + ">" +
@@ -286,7 +302,7 @@ void scanNetworks() {
   bool useCustom = wifiSsid.length() > 0 && !savedSsidFound;
   networkOptions += String("<option value='custom'") + (useCustom ? " selected" : "") + ">Custom SSID...</option>";
 
-  writeStatus("portal", "Found " + String(n) + " networks");
+  writeStatus("portal", "Found " + String(n) + " access points, " + String(unique) + " networks");
 }
 
 void handleRoot() {
